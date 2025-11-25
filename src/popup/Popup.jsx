@@ -16,11 +16,23 @@ export default function Popup() {
   // Load assignments from storage
   useEffect(() => {
     chrome.storage.local.get(["assignments"], (data) => {
-      const arr = (data.assignments || []).map((a) => ({
+      let arr = (data.assignments || []).map((a) => ({
         ...a,
         deadlineDate: parseISO(a.deadline),
       }));
+    arr = arr.filter((a) => {
+      const isSubmitted =
+        a.status?.toLowerCase().includes("submitted") ||
+        a.status?.toLowerCase().includes("marked") ||
+        a.submitted === true;
 
+      const deadlineExceeded =
+        a.deadlineStatus?.toLowerCase().includes("exceeded") ||
+        a.deadlineText?.toLowerCase().includes("exceeded") ||
+        (a.deadlineDate && new Date() > a.deadlineDate);
+
+      return !isSubmitted && !deadlineExceeded;
+    });
       arr.sort(
         (x, y) =>
           (x.deadlineDate?.getTime() || Infinity) -
