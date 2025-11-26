@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Bahria LMS Assignment Tracker",
   "description": "Collects assignment deadlines from lms.bahria.edu.pk and shows priority-sorted to-dos + notifications.",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "action": {
     "default_popup": "dist/popup.html"
   },
@@ -13,7 +13,7 @@
   },
   "permissions": ["storage", "alarms", "notifications", "tabs", "scripting", "activeTab"],
   "host_permissions": ["*://lms.bahria.edu.pk/*"],
-  
+
   "background": {
     "service_worker": "background.js"
   },
