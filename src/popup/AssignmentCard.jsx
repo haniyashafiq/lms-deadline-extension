@@ -67,7 +67,7 @@ export default function AssignmentCard({ a, onOpen, diff }) {
 
         <button
           onClick={onOpen}
-          className="flex items-center gap-1.5 text-[11px] font-semibold px-3 py-1.5 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700 transition-all shadow-sm hover:shadow-md"
+          className="flex items-center gap-1.5 text-[11px] font-semibold px-3 py-1.5 rounded-md bg-[#00C0EF] text-white hover:from-blue-700 hover:to-indigo-700 transition-all shadow-sm hover:shadow-md"
         >
           <LinkIcon className="w-3.5 h-3.5" />
           Open

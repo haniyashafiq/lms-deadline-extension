@@ -61,6 +61,28 @@ export default function Popup() {
         return;
       }
 
+      // Reload the first LMS tab to ensure content script is injected
+      const targetTab = tabs[0];
+      await chrome.tabs.reload(targetTab.id);
+
+      // Wait for the tab to finish loading
+      await new Promise((resolve) => {
+        const listener = (tabId, changeInfo) => {
+          if (tabId === targetTab.id && changeInfo.status === 'complete') {
+            chrome.tabs.onUpdated.removeListener(listener);
+            // Give content script a moment to initialize
+            setTimeout(resolve, 500);
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+
+        // Safety timeout
+        setTimeout(() => {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }, 10000);
+      });
+
       await new Promise((resolve, reject) => {
         chrome.runtime.sendMessage({ type: 'collect_all_courses' }, (response) => {
           if (chrome.runtime.lastError) {
@@ -92,7 +114,7 @@ export default function Popup() {
   return (
     <div className="w-[400px] font-sans bg-gradient-to-br from-slate-50 to-slate-100 min-h-[500px]">
       {/* Header with gradient */}
-      <div className="bg-gradient-to-r from-blue-600 to-indigo-600 p-5 shadow-lg">
+      <div className="bg-[#f39c12] p-5 shadow-lg">
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-xl font-bold text-white tracking-tight flex items-center gap-2">
@@ -103,7 +125,7 @@ export default function Popup() {
           <button
             onClick={syncAllCourses}
             disabled={isSyncing}
-            className="px-4 py-2 text-xs font-semibold text-blue-600 bg-white hover:bg-blue-50 disabled:bg-gray-300 disabled:text-gray-500 rounded-lg transition-all shadow-md hover:shadow-lg flex items-center gap-2"
+            className="px-4 py-2 text-xs font-semibold text-slate-700 bg-white hover:bg-blue-50 disabled:bg-gray-300 disabled:text-gray-500 rounded-lg transition-all shadow-md hover:shadow-lg flex items-center gap-2"
             title="Sync assignments from all courses"
           >
             {isSyncing ? (
