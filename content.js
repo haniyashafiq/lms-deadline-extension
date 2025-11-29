@@ -80,13 +80,21 @@ function scrapeAssignmentsFromDOM() {
       }
     }
 
-    // Check submission status from column 3 (typically "No Submission" or "Added Submission")
-    // Only include assignments that have NOT been submitted
+    // Check submission status from column 3
+    // "No Submission" = not submitted (include it)
+    // "Submission" = submitted (exclude it)
+    // "Added Submission" or similar = submitted (exclude it)
     const submissionCol = cols[3]?.innerText?.trim?.() || '';
-    const isSubmitted = submissionCol && !/No Submission/i.test(submissionCol);
+    const noSubmission = /no\s+submission/i.test(submissionCol);
+    const hasSubmission = submissionCol && !noSubmission && /submission/i.test(submissionCol);
+    const isSubmitted = hasSubmission;
+
+    // Debug log for troubleshooting
+    console.log(`Assignment: ${title}, Status: "${submissionCol}", isSubmitted: ${isSubmitted}`);
 
     // Skip submitted assignments
     if (isSubmitted) {
+      console.log(`  → Skipping (submitted)`);
       continue;
     }
 

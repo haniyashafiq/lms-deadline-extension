@@ -4,6 +4,7 @@ console.log('🔥 Background service worker loaded');
 
 // --- existing settings & helper functions kept (reminder offsets, assignId, storage helpers) ---
 const REMINDER_OFFSETS = [
+  { key: 'reminder_11d', ms: 11 * 24 * 60 * 60 * 1000 },
   { key: 'reminder_24h', ms: 24 * 60 * 60 * 1000 },
   { key: 'reminder_6h', ms: 6 * 60 * 60 * 1000 },
   { key: 'reminder_1h', ms: 60 * 60 * 1000 },
@@ -36,6 +37,43 @@ async function setStoredAssignments(list) {
   return new Promise((res) => {
     chrome.storage.local.set({ assignments: list }, () => res());
   });
+}
+
+async function getShownNotifications() {
+  return new Promise((res) => {
+    chrome.storage.local.get(['shownNotifications'], (data) => {
+      res(data.shownNotifications || {});
+    });
+  });
+}
+
+async function markNotificationShown(assignmentId, offsetKey) {
+  const shown = await getShownNotifications();
+  const key = `${assignmentId}::${offsetKey}`;
+  shown[key] = Date.now();
+  return new Promise((res) => {
+    chrome.storage.local.set({ shownNotifications: shown }, () => res());
+  });
+}
+
+function formatTimeRemaining(ms) {
+  const days = Math.floor(ms / (1000 * 60 * 60 * 24));
+  const hours = Math.floor((ms % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+  const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
+
+  if (days > 0) {
+    return hours > 0
+      ? `${days} day${days > 1 ? 's' : ''} ${hours} hour${hours > 1 ? 's' : ''}`
+      : `${days} day${days > 1 ? 's' : ''}`;
+  } else if (hours > 0) {
+    return minutes > 30
+      ? `${hours + 1} hour${hours + 1 > 1 ? 's' : ''}`
+      : `${hours} hour${hours > 1 ? 's' : ''}`;
+  } else if (minutes > 0) {
+    return `${minutes} minute${minutes > 1 ? 's' : ''}`;
+  } else {
+    return 'less than a minute';
+  }
 }
 
 function setAlarmsForAssignment(a) {
@@ -87,6 +125,62 @@ async function mergeAssignments(incoming) {
     clearAlarmsForAssignmentId(m.id);
     setAlarmsForAssignment(m);
   });
+}
+
+// Periodic check: scan all assignments and show notifications if they cross thresholds
+async function checkAndNotifyUpcomingDeadlines() {
+  try {
+    const assignments = await getStoredAssignments();
+    const shown = await getShownNotifications();
+    const now = Date.now();
+
+    for (const a of assignments) {
+      if (!a.deadline) continue;
+      const deadline = new Date(a.deadline).getTime();
+      if (isNaN(deadline)) continue;
+
+      const timeUntilDeadline = deadline - now;
+
+      // Check each reminder threshold
+      for (const offset of REMINDER_OFFSETS) {
+        const notificationKey = `${a.id}::${offset.key}`;
+
+        // Skip if already shown
+        if (shown[notificationKey]) continue;
+
+        // Check if we're within the notification window (e.g., less than 11 days but more than 10 days)
+        // Give a 6-hour window after crossing the threshold to catch it
+        const windowMs = 6 * 60 * 60 * 1000; // 6 hours
+        const crossedThreshold = timeUntilDeadline <= offset.ms;
+        const stillInWindow = timeUntilDeadline > offset.ms - windowMs;
+
+        if (crossedThreshold && stillInWindow) {
+          const actualTimeRemaining = formatTimeRemaining(timeUntilDeadline);
+
+          const title = `Upcoming due: ${a.title}`;
+          const message = `${a.course ? a.course + ' — ' : ''}Due in ${actualTimeRemaining}`;
+
+          chrome.notifications.create(
+            notificationKey,
+            {
+              type: 'basic',
+              title,
+              message,
+              iconUrl: 'public/icon128.png',
+            },
+            () => {
+              console.log(`📬 Periodic notification shown: ${a.title} (${offset.key})`);
+            }
+          );
+
+          // Mark as shown
+          await markNotificationShown(a.id, offset.key);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Error in periodic deadline check:', err);
+  }
 }
 
 // --- END helpers ---
@@ -148,8 +242,8 @@ async function collectAllCoursesFromTab(tabId, baseUrl, options) {
           if (updatedTabId !== tabId) return;
           if (changeInfo.status === 'complete') {
             chrome.tabs.onUpdated.removeListener(onUpdated);
-            // Reduced wait time from 600ms to 200ms
-            setTimeout(resolveNav, 200);
+            // Reduced wait time from 200ms to 100ms
+            setTimeout(resolveNav, 100);
           }
         }
         chrome.tabs.onUpdated.addListener(onUpdated);
@@ -196,13 +290,13 @@ async function collectAllCoursesFromTab(tabId, baseUrl, options) {
             chrome.runtime.onMessage.removeListener(onMsg);
             resolve([]);
           } else {
-            // Reduced timeout from 8s to 3s
+            // Reduced timeout from 3s to 1.5s
             setTimeout(() => {
               if (!resolved) {
                 chrome.runtime.onMessage.removeListener(onMsg);
                 resolve([]);
               }
-            }, 3000);
+            }, 1500);
           }
         });
       });
@@ -213,17 +307,20 @@ async function collectAllCoursesFromTab(tabId, baseUrl, options) {
       console.warn('Error collecting partial for', opt.value, err);
     }
 
-    // Reduced delay between requests from 250ms to 100ms
-    await wait(100);
+    // Reduced delay between requests from 100ms to 50ms
+    await wait(50);
   }
 
-  // Merge collected assignments into storage (this will create ids and set alarms)
+  // Clear old data and replace with fresh collected assignments
   try {
-    console.log('Merging total collected assignments:', collected.length);
+    console.log('Replacing storage with fresh collected assignments:', collected.length);
+    // Clear existing assignments first to remove submitted/old ones
+    await setStoredAssignments([]);
+    // Now add the fresh collected assignments
     await mergeAssignments(collected);
-    console.log('🔔 Full collection finished and merged.');
+    console.log('🔔 Full collection finished and storage updated.');
   } catch (err) {
-    console.error('Error merging collected assignments:', err);
+    console.error('Error updating collected assignments:', err);
   } finally {
     isCollectingAll = false;
   }
@@ -316,6 +413,14 @@ chrome.onNotificationShown?.(console.log); // no-op in some runtimes
 chrome.alarms.onAlarm.addListener((alarm) => {
   try {
     const name = alarm.name;
+
+    // Handle periodic deadline check
+    if (name === 'periodic_deadline_check') {
+      console.log('⏰ Running periodic deadline check...');
+      checkAndNotifyUpcomingDeadlines();
+      return;
+    }
+
     const parts = name.split('::');
     if (parts.length !== 2) return;
     const aid = parts[0];
@@ -326,17 +431,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       const a = assignments.find((x) => x.id === aid);
       if (!a) return;
 
-      const whenText =
-        offsetKey === 'reminder_24h'
-          ? '24 hours'
-          : offsetKey === 'reminder_6h'
-          ? '6 hours'
-          : offsetKey === 'reminder_1h'
-          ? '1 hour'
-          : '';
+      // Calculate actual time remaining
+      const deadline = new Date(a.deadline).getTime();
+      const timeRemaining = deadline - Date.now();
+      const actualTimeRemaining = formatTimeRemaining(timeRemaining);
 
       const title = `Upcoming due: ${a.title}`;
-      const message = `${a.course ? a.course + ' — ' : ''}Due in ~${whenText}`;
+      const message = `${a.course ? a.course + ' — ' : ''}Due in ${actualTimeRemaining}`;
 
       chrome.notifications.create(
         a.id + '::' + offsetKey,
@@ -346,7 +447,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
           message,
           iconUrl: 'public/icon128.png',
         },
-        () => {}
+        async () => {
+          // Mark as shown to prevent duplicate from periodic check
+          await markNotificationShown(a.id, offsetKey);
+        }
       );
     });
   } catch (err) {
@@ -354,13 +458,32 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-// On install: default settings
+// On install: default settings and periodic alarm
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.get(['settings'], (data) => {
     if (!data.settings) {
       chrome.storage.local.set({
-        settings: { reminders: ['reminder_24h', 'reminder_6h', 'reminder_1h'] },
+        settings: { reminders: ['reminder_11d', 'reminder_24h', 'reminder_6h', 'reminder_1h'] },
       });
     }
   });
+
+  // Set up periodic check every 3 hours
+  chrome.alarms.create('periodic_deadline_check', {
+    periodInMinutes: 180, // 3 hours
+  });
+
+  // Run initial check immediately
+  console.log('🚀 Running initial deadline check...');
+  checkAndNotifyUpcomingDeadlines();
+});
+
+// Also set up periodic alarm on startup (in case service worker was restarted)
+chrome.alarms.get('periodic_deadline_check', (alarm) => {
+  if (!alarm) {
+    chrome.alarms.create('periodic_deadline_check', {
+      periodInMinutes: 180,
+    });
+    console.log('🚀 Periodic alarm created on startup');
+  }
 });
