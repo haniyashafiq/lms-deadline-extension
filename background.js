@@ -1,13 +1,12 @@
-// background.js
 /* global chrome */
 console.log('🔥 Background service worker loaded');
 
 // --- existing settings & helper functions kept (reminder offsets, assignId, storage helpers) ---
 const REMINDER_OFFSETS = [
-  { key: 'reminder_11d', ms: 11 * 24 * 60 * 60 * 1000 },
-  { key: 'reminder_24h', ms: 24 * 60 * 60 * 1000 },
-  { key: 'reminder_6h', ms: 6 * 60 * 60 * 1000 },
-  { key: 'reminder_1h', ms: 60 * 60 * 1000 },
+  { key: 'reminder_3d', ms: 3 * 24 * 60 * 60 * 1000 },
+  { key: 'reminder_2d', ms: 2 * 24 * 60 * 60 * 1000 },
+  // "Today" reminder: trigger at the deadline time
+  { key: 'reminder_today', ms: 0 },
 ];
 
 function normalize(str) {
@@ -56,23 +55,12 @@ async function markNotificationShown(assignmentId, offsetKey) {
   });
 }
 
-function formatTimeRemaining(ms) {
-  const days = Math.floor(ms / (1000 * 60 * 60 * 24));
-  const hours = Math.floor((ms % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-  const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
-
-  if (days > 0) {
-    return hours > 0
-      ? `${days} day${days > 1 ? 's' : ''} ${hours} hour${hours > 1 ? 's' : ''}`
-      : `${days} day${days > 1 ? 's' : ''}`;
-  } else if (hours > 0) {
-    return minutes > 30
-      ? `${hours + 1} hour${hours + 1 > 1 ? 's' : ''}`
-      : `${hours} hour${hours > 1 ? 's' : ''}`;
-  } else if (minutes > 0) {
-    return `${minutes} minute${minutes > 1 ? 's' : ''}`;
-  } else {
-    return 'less than a minute';
+function formatDueDateString(deadlineMs) {
+  try {
+    const d = new Date(deadlineMs);
+    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  } catch {
+    return '';
   }
 }
 
@@ -132,55 +120,73 @@ async function checkAndNotifyUpcomingDeadlines() {
   try {
     const assignments = await getStoredAssignments();
     const shown = await getShownNotifications();
-    const now = Date.now();
+
+    const msInDay = 24 * 60 * 60 * 1000;
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
 
     for (const a of assignments) {
       if (!a.deadline) continue;
       const deadline = new Date(a.deadline).getTime();
       if (isNaN(deadline)) continue;
 
-      const timeUntilDeadline = deadline - now;
+      const dueDay = new Date(deadline);
+      dueDay.setHours(0, 0, 0, 0);
+      const dayDiff = Math.round((dueDay.getTime() - todayStart.getTime()) / msInDay);
 
-      // Check each reminder threshold
-      for (const offset of REMINDER_OFFSETS) {
-        const notificationKey = `${a.id}::${offset.key}`;
-
-        // Skip if already shown
-        if (shown[notificationKey]) continue;
-
-        // Check if we're within the notification window (e.g., less than 11 days but more than 10 days)
-        // Give a 6-hour window after crossing the threshold to catch it
-        const windowMs = 6 * 60 * 60 * 1000; // 6 hours
-        const crossedThreshold = timeUntilDeadline <= offset.ms;
-        const stillInWindow = timeUntilDeadline > offset.ms - windowMs;
-
-        if (crossedThreshold && stillInWindow) {
-          const actualTimeRemaining = formatTimeRemaining(timeUntilDeadline);
-
-          const title = `Upcoming due: ${a.title}`;
-          const message = `${a.course ? a.course + ' — ' : ''}Due in ${actualTimeRemaining}`;
-
-          chrome.notifications.create(
-            notificationKey,
-            {
-              type: 'basic',
-              title,
-              message,
-              iconUrl: 'public/icon128.png',
-            },
-            () => {
-              console.log(`📬 Periodic notification shown: ${a.title} (${offset.key})`);
-            }
-          );
-
-          // Mark as shown
-          await markNotificationShown(a.id, offset.key);
-        }
+      let keyToUse = null;
+      let messageSuffix = '';
+      if (dayDiff === 3) {
+        keyToUse = 'reminder_3d';
+        messageSuffix = `Due in 3 days • ${formatDueDateString(deadline)}`;
+      } else if (dayDiff === 2) {
+        keyToUse = 'reminder_2d';
+        messageSuffix = `Due in 2 days • ${formatDueDateString(deadline)}`;
+      } else if (dayDiff === 0) {
+        keyToUse = 'reminder_today';
+        messageSuffix = `Due today`;
       }
+
+      if (!keyToUse) continue;
+
+      const notificationKey = `${a.id}::${keyToUse}`;
+      if (shown[notificationKey]) continue;
+
+      const title = `Upcoming due: ${a.title}`;
+      const message = `${a.course ? a.course + ' — ' : ''}${messageSuffix}`;
+
+      chrome.notifications.create(
+        notificationKey,
+        {
+          type: 'basic',
+          title,
+          message,
+          iconUrl: 'public/icon128.png',
+          requireInteraction: true,
+          priority: 2,
+        },
+        () => {
+          console.log(`📬 Periodic notification shown: ${a.title} (${keyToUse})`);
+        }
+      );
+
+      await markNotificationShown(a.id, keyToUse);
     }
   } catch (err) {
     console.error('Error in periodic deadline check:', err);
   }
+}
+
+// Send progress updates to popup
+function sendSyncProgress(current, total, courseName) {
+  chrome.runtime
+    .sendMessage({
+      type: 'sync_progress',
+      current,
+      total,
+      courseName,
+    })
+    .catch(() => {}); // Ignore errors if popup is closed
 }
 
 // --- END helpers ---
@@ -228,99 +234,134 @@ async function collectAllCoursesFromTab(tabId, baseUrl, options) {
   console.log('🔄 Starting full collection of all courses...');
 
   const collected = [];
+  const failedCourses = [];
+  const totalCourses = options.length;
 
-  for (const opt of options) {
+  for (let i = 0; i < options.length; i++) {
+    const opt = options[i];
     if (!opt.value) continue; // skip "Select Course" empty
+
     const targetUrl = buildUrlWithOc(baseUrl, opt.value);
-    console.log('→ Navigating to', opt.label, opt.value, targetUrl);
+    const courseName = opt.label || `Course ${i + 1}`;
 
-    // Navigate the existing tab (faster than creating new tabs)
-    try {
-      await new Promise((resolveNav, rejectNav) => {
-        // Listen for tab update that indicates load complete
-        function onUpdated(updatedTabId, changeInfo) {
-          if (updatedTabId !== tabId) return;
-          if (changeInfo.status === 'complete') {
-            chrome.tabs.onUpdated.removeListener(onUpdated);
-            // Reduced wait time from 200ms to 100ms
-            setTimeout(resolveNav, 100);
+    console.log(`→ [${i + 1}/${totalCourses}] Navigating to`, courseName, targetUrl);
+
+    // Send progress update
+    sendSyncProgress(i + 1, totalCourses, courseName);
+
+    let retryCount = 0;
+    let success = false;
+
+    // Retry logic: try up to 2 times (1 initial + 1 retry)
+    while (retryCount < 2 && !success) {
+      try {
+        // Navigate the existing tab (faster than creating new tabs)
+        await new Promise((resolveNav, rejectNav) => {
+          const startTime = Date.now();
+
+          // Listen for tab update that indicates load complete
+          function onUpdated(updatedTabId, changeInfo) {
+            if (updatedTabId !== tabId) return;
+            if (changeInfo.status === 'complete') {
+              chrome.tabs.onUpdated.removeListener(onUpdated);
+              const loadTime = Date.now() - startTime;
+              // Dynamic wait: fast connection = short wait, slow = longer wait
+              const waitTime = loadTime > 3000 ? 200 : 100;
+              setTimeout(resolveNav, waitTime);
+            }
           }
-        }
-        chrome.tabs.onUpdated.addListener(onUpdated);
-        chrome.tabs.update(tabId, { url: targetUrl }, () => {
-          if (chrome.runtime.lastError) {
+          chrome.tabs.onUpdated.addListener(onUpdated);
+          chrome.tabs.update(tabId, { url: targetUrl }, () => {
+            if (chrome.runtime.lastError) {
+              chrome.tabs.onUpdated.removeListener(onUpdated);
+              rejectNav(chrome.runtime.lastError);
+            }
+          });
+
+          // Adaptive timeout: 15s for slow connections, but resolves early if page loads fast
+          setTimeout(() => {
             chrome.tabs.onUpdated.removeListener(onUpdated);
-            rejectNav(chrome.runtime.lastError);
-          } else {
-            // navigation started; onUpdated handler will resolve when done
-          }
+            resolveNav();
+          }, 15000);
         });
-        // Reduced safety timeout from 15s to 8s
-        setTimeout(() => {
-          chrome.tabs.onUpdated.removeListener(onUpdated);
-          resolveNav();
-        }, 8000);
-      });
-    } catch (navErr) {
-      console.warn('Navigation error for', opt.value, navErr);
-      continue;
-    }
 
-    // After load, ask the content script on that tab to scrape
-    try {
-      const partial = await new Promise((resolve) => {
-        let resolved = false;
+        // After load, ask the content script on that tab to scrape
+        const partial = await new Promise((resolve) => {
+          let resolved = false;
 
-        // Handler for partial responses
-        function onMsg(msg) {
-          if (!msg || msg.type !== 'lms_assignments_partial') return;
-          // Accept messages from any sender
-          resolved = true;
-          chrome.runtime.onMessage.removeListener(onMsg);
-          resolve(msg.assignments || []);
-        }
-
-        chrome.runtime.onMessage.addListener(onMsg);
-
-        // Ask the content script to run a scrape now
-        chrome.tabs.sendMessage(tabId, { type: 'scrape_now' }, () => {
-          // resp may be undefined if no content script reply
-          if (chrome.runtime.lastError) {
-            // no content script present; remove listener and resolve empty
+          // Handler for partial responses
+          function onMsg(msg) {
+            if (!msg || msg.type !== 'lms_assignments_partial') return;
+            resolved = true;
             chrome.runtime.onMessage.removeListener(onMsg);
-            resolve([]);
-          } else {
-            // Reduced timeout from 3s to 1.5s
-            setTimeout(() => {
-              if (!resolved) {
-                chrome.runtime.onMessage.removeListener(onMsg);
-                resolve([]);
-              }
-            }, 1500);
+            resolve(msg.assignments || []);
           }
-        });
-      });
 
-      console.log('Collected', partial.length, 'items from', opt.label || opt.value);
-      appendUniqueAggregate(collected, partial);
-    } catch (err) {
-      console.warn('Error collecting partial for', opt.value, err);
+          chrome.runtime.onMessage.addListener(onMsg);
+
+          // Ask the content script to run a scrape now
+          chrome.tabs.sendMessage(tabId, { type: 'scrape_now' }, () => {
+            if (chrome.runtime.lastError) {
+              chrome.runtime.onMessage.removeListener(onMsg);
+              resolve([]);
+            } else {
+              // 2.5s timeout for scrape (increased from 1.5s)
+              setTimeout(() => {
+                if (!resolved) {
+                  chrome.runtime.onMessage.removeListener(onMsg);
+                  resolve([]);
+                }
+              }, 2500);
+            }
+          });
+        });
+
+        console.log(`✓ Collected ${partial.length} items from ${courseName}`);
+        appendUniqueAggregate(collected, partial);
+
+        // Incremental update: merge immediately so popup updates in real-time
+        if (partial.length > 0) {
+          await mergeAssignments(partial);
+        }
+
+        success = true;
+      } catch (err) {
+        retryCount++;
+        console.warn(`⚠️ Attempt ${retryCount} failed for ${courseName}:`, err);
+
+        if (retryCount < 2) {
+          console.log(`🔄 Retrying ${courseName}...`);
+          await wait(1000); // Wait 1s before retry
+        } else {
+          console.error(`✗ Failed ${courseName} after ${retryCount} attempts`);
+          failedCourses.push(courseName);
+        }
+      }
     }
 
-    // Reduced delay between requests from 100ms to 50ms
+    // Small delay between courses
     await wait(50);
   }
 
-  // Clear old data and replace with fresh collected assignments
+  // Final update
   try {
-    console.log('Replacing storage with fresh collected assignments:', collected.length);
-    // Clear existing assignments first to remove submitted/old ones
-    await setStoredAssignments([]);
-    // Now add the fresh collected assignments
-    await mergeAssignments(collected);
+    console.log(`📊 Collection complete: ${collected.length} total assignments`);
+    if (failedCourses.length > 0) {
+      console.warn(`⚠️ Failed courses (${failedCourses.length}):`, failedCourses.join(', '));
+    }
+
+    // Send completion message to popup
+    chrome.runtime
+      .sendMessage({
+        type: 'sync_complete',
+        totalAssignments: collected.length,
+        failedCourses,
+      })
+      .catch(() => {});
+
     console.log('🔔 Full collection finished and storage updated.');
   } catch (err) {
-    console.error('Error updating collected assignments:', err);
+    console.error('Error in final collection update:', err);
   } finally {
     isCollectingAll = false;
   }
@@ -339,10 +380,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // Partial assignments response from content script (when asked to scrape)
   if (msg.type === 'lms_assignments_partial') {
-    // The orchestrator above listens to this via runtime.onMessage too
     console.log('📩 Background received partial:', (msg.assignments || []).length);
-    // No merging here; the orchestrator will merge collected array after iterating
-    // But also merge direct partials (if desired) so the popup is updated as soon as possible:
     if (Array.isArray(msg.assignments) && msg.assignments.length) {
       mergeAssignments(msg.assignments).catch((err) => console.error(err));
     }
@@ -351,18 +389,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // Course options reported by content script
   if (msg.type === 'course_options') {
-    // sender.tab contains which tab provided the options
     const options = Array.isArray(msg.options) ? msg.options : [];
     const tabId = sender?.tab?.id;
     console.log('📚 Received course options:', options.length, 'from tab', tabId);
-
-    // DISABLED: Automatic full collection (was annoying - page kept navigating)
-    // To enable manual collection, add a button in the popup that sends 'collect_all_courses'
-    // if (options.length > 0 && tabId && currentUrl) {
-    //   collectAllCoursesFromTab(tabId, currentUrl, options).catch(e => {
-    //     console.error("Error during full collection:", e);
-    //   });
-    // }
     return;
   }
 
@@ -408,8 +437,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // Existing alarms + notifications handling (unchanged)
-chrome.onNotificationShown?.(console.log); // no-op in some runtimes
-
 chrome.alarms.onAlarm.addListener((alarm) => {
   try {
     const name = alarm.name;
@@ -430,28 +457,41 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       const assignments = data.assignments || [];
       const a = assignments.find((x) => x.id === aid);
       if (!a) return;
-
-      // Calculate actual time remaining
       const deadline = new Date(a.deadline).getTime();
-      const timeRemaining = deadline - Date.now();
-      const actualTimeRemaining = formatTimeRemaining(timeRemaining);
+      getShownNotifications().then((shown) => {
+        const notificationKey = `${a.id}::${offsetKey}`;
+        if (shown[notificationKey]) return; // Avoid duplicate if periodic already showed
 
-      const title = `Upcoming due: ${a.title}`;
-      const message = `${a.course ? a.course + ' — ' : ''}Due in ${actualTimeRemaining}`;
-
-      chrome.notifications.create(
-        a.id + '::' + offsetKey,
-        {
-          type: 'basic',
-          title,
-          message,
-          iconUrl: 'public/icon128.png',
-        },
-        async () => {
-          // Mark as shown to prevent duplicate from periodic check
-          await markNotificationShown(a.id, offsetKey);
+        const title = `Upcoming due: ${a.title}`;
+        let messageSuffix = '';
+        if (offsetKey === 'reminder_3d') {
+          messageSuffix = `Due in 3 days • ${formatDueDateString(deadline)}`;
+        } else if (offsetKey === 'reminder_2d') {
+          messageSuffix = `Due in 2 days • ${formatDueDateString(deadline)}`;
+        } else if (offsetKey === 'reminder_today') {
+          messageSuffix = 'Due today';
+        } else {
+          // Fallback if unknown key
+          messageSuffix = `Due ${formatDueDateString(deadline)}`;
         }
-      );
+        const message = `${a.course ? a.course + ' — ' : ''}${messageSuffix}`;
+
+        chrome.notifications.create(
+          notificationKey,
+          {
+            type: 'basic',
+            title,
+            message,
+            iconUrl: 'public/icon128.png',
+            requireInteraction: true,
+            priority: 2,
+          },
+          async () => {
+            // Mark as shown to prevent duplicate from periodic check
+            await markNotificationShown(a.id, offsetKey);
+          }
+        );
+      });
     });
   } catch (err) {
     console.error('Alarm error:', err);

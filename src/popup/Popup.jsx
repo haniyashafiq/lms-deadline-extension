@@ -8,11 +8,8 @@ export default function Popup() {
   const [assignments, setAssignments] = useState([]);
   const [now, setNow] = useState(new Date());
   const [isSyncing, setIsSyncing] = useState(false);
-
-  useEffect(() => {
-    const t = setInterval(() => setNow(new Date()), 60000);
-    return () => clearInterval(t);
-  }, []);
+  const [syncProgress, setSyncProgress] = useState({ current: 0, total: 0, courseName: '' });
+  const [syncPhase, setSyncPhase] = useState('');
 
   useEffect(() => {
     function fetchAssignments() {
@@ -39,19 +36,40 @@ export default function Popup() {
     }
 
     fetchAssignments();
+    const int = setInterval(() => setNow(new Date()), 30000);
 
-    // Listen for storage changes to refresh immediately when data is updated
-    const storageListener = (changes, areaName) => {
-      if (areaName === 'local' && changes.assignments) {
+    // Listen for storage changes to auto-refresh
+    const storageListener = (changes) => {
+      if (changes.assignments) {
         fetchAssignments();
       }
     };
     chrome.storage.onChanged.addListener(storageListener);
 
-    const interval = setInterval(fetchAssignments, 30000); // refresh every 30s
+    // Listen for sync progress updates
+    const messageListener = (msg) => {
+      if (msg.type === 'sync_progress') {
+        setSyncProgress({ current: msg.current, total: msg.total, courseName: msg.courseName });
+      } else if (msg.type === 'sync_complete') {
+        setIsSyncing(false);
+        setSyncProgress({ current: 0, total: 0, courseName: '' });
+        fetchAssignments();
+
+        if (msg.failedCourses && msg.failedCourses.length > 0) {
+          alert(
+            `Sync complete with ${
+              msg.failedCourses.length
+            } failed course(s):\n${msg.failedCourses.join(', ')}`
+          );
+        }
+      }
+    };
+    chrome.runtime.onMessage.addListener(messageListener);
+
     return () => {
-      clearInterval(interval);
+      clearInterval(int);
       chrome.storage.onChanged.removeListener(storageListener);
+      chrome.runtime.onMessage.removeListener(messageListener);
     };
   }, []);
 
@@ -60,87 +78,90 @@ export default function Popup() {
   }
 
   async function syncAllCourses() {
+    if (isSyncing) return;
     setIsSyncing(true);
+    setSyncPhase('Checking LMS tab');
+    setSyncProgress({ current: 0, total: 0, courseName: '' });
     try {
-      // First check if there's an LMS tab open
       const tabs = await chrome.tabs.query({ url: '*://lms.bahria.edu.pk/*' });
-
-      if (tabs.length === 0) {
-        // No LMS tab open, open one and show message
+      if (!tabs || tabs.length === 0) {
+        setSyncPhase('Opening assignments page');
         await chrome.tabs.create({ url: 'https://lms.bahria.edu.pk/Student/Assignments.php' });
-        alert('LMS page opened. Please wait for it to load, then click "Sync All" again.');
+        setSyncPhase('Page opened. Click Refresh again after load.');
         setIsSyncing(false);
         return;
       }
+      let targetTab = tabs.find(t => /Assignments\.php/i.test(t.url)) || tabs[0];
 
-      // Check if tab is already fully loaded
-      const targetTab = tabs[0];
-      const needsReload = targetTab.status !== 'complete';
-
-      if (needsReload) {
-        // Only reload if page isn't fully loaded
-        await chrome.tabs.reload(targetTab.id, { bypassCache: true });
-
-        // Wait for the tab to finish loading
+      if (!/Assignments\.php/i.test(targetTab.url)) {
+        setSyncPhase('Navigating to assignments page');
         await new Promise((resolve) => {
           const listener = (tabId, changeInfo) => {
             if (tabId === targetTab.id && changeInfo.status === 'complete') {
               chrome.tabs.onUpdated.removeListener(listener);
-              // Reduced from 800ms to 300ms
+              setTimeout(resolve, 250);
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          chrome.tabs.update(targetTab.id, { url: 'https://lms.bahria.edu.pk/Student/Assignments.php' });
+          setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 15000);
+        });
+        targetTab = await chrome.tabs.get(targetTab.id);
+      }
+
+      if (targetTab.status !== 'complete') {
+        setSyncPhase('Waiting for page load');
+        await new Promise((resolve) => {
+          const listener = (tabId, changeInfo) => {
+            if (tabId === targetTab.id && changeInfo.status === 'complete') {
+              chrome.tabs.onUpdated.removeListener(listener);
+              setTimeout(resolve, 200);
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 15000);
+        });
+      }
+
+      setSyncPhase('Requesting course list');
+      let response = await chrome.runtime.sendMessage({ type: 'collect_all_courses' });
+
+      if (!response.ok && /course options|No courses/i.test(response.error || '')) {
+        setSyncPhase('Retry: reloading page');
+        await chrome.tabs.reload(targetTab.id, { bypassCache: true });
+        await new Promise((resolve) => {
+          const listener = (tabId, changeInfo) => {
+            if (tabId === targetTab.id && changeInfo.status === 'complete') {
+              chrome.tabs.onUpdated.removeListener(listener);
               setTimeout(resolve, 300);
             }
           };
           chrome.tabs.onUpdated.addListener(listener);
-
-          // Safety timeout
-          setTimeout(() => {
-            chrome.tabs.onUpdated.removeListener(listener);
-            resolve();
-          }, 10000);
+          setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 15000);
         });
-      } else {
-        // Page already loaded, just wait briefly for content script to be ready
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        setSyncPhase('Retry: requesting course list');
+        response = await chrome.runtime.sendMessage({ type: 'collect_all_courses' });
       }
 
-      await new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage({ type: 'collect_all_courses' }, (response) => {
-          if (chrome.runtime.lastError) {
-            reject(chrome.runtime.lastError);
-          } else if (response && response.ok) {
-            resolve();
-          } else {
-            reject(new Error(response?.error || 'Failed to sync'));
-          }
-        });
-      });
-
-      // Success feedback
-      console.log('Sync completed successfully');
+      if (!response.ok) throw new Error(response.error || 'Sync failed');
+      setSyncPhase('Collecting courses ...');
     } catch (err) {
       console.error('Sync error:', err);
-      const errorMsg = err.message || String(err);
-
-      if (errorMsg.includes('no options from page') || errorMsg.includes('no active tab')) {
-        alert('Please open the LMS Assignments page first, then try syncing again.');
-      } else {
-        alert(`Sync failed: ${errorMsg}\n\nMake sure you're logged into the LMS.`);
-      }
-    } finally {
+      setSyncPhase('Error: ' + (err.message || 'Unknown'));
+      alert(`Sync error: ${err.message}`);
       setIsSyncing(false);
+      setSyncProgress({ current: 0, total: 0, courseName: '' });
     }
   }
 
   return (
     <div className="w-[400px] font-sans bg-gradient-to-br from-slate-50 to-slate-100 min-h-[500px]">
-      {/* Header with gradient */}
+      {/* Header with original orange theme */}
       <div className="bg-[#f39c12] p-5 shadow-lg">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-lg sm:text-xl font-bold text-white tracking-tight">
-              Pending Assignments
-            </h1>
-            <p className="text-xs sm:text-sm text-blue-100 mt-1">Stay on top of your deadlines</p>
+            <h1 className="text-xl font-bold text-white tracking-tight">Pending Assignments</h1>
+            <p className="text-xs text-blue-100 mt-1">Stay on top of your deadlines</p>
           </div>
           <button
             onClick={syncAllCourses}
@@ -183,6 +204,14 @@ export default function Popup() {
             )}
           </button>
         </div>
+        {(isSyncing || syncPhase) && (
+          <div className="mt-3 text-[10px] text-white/90 space-y-1">
+            {syncPhase && <div>{syncPhase}</div>}
+            {isSyncing && syncProgress.total > 0 && (
+              <div>Course {syncProgress.current}/{syncProgress.total}: {syncProgress.courseName}</div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Content area */}
@@ -193,12 +222,12 @@ export default function Popup() {
               <AlertCircle className="w-12 h-12 mx-auto mb-3 text-slate-400" />
               <p className="text-slate-700 font-semibold mb-1">No pending assignments</p>
               <p className="text-xs text-slate-500 mt-2 max-w-[250px] mx-auto">
-                Click "Sync All" above or visit your LMS assignments page to load your assignments.
+                Click "Refresh" above or visit your LMS assignments page to load your assignments.
               </p>
             </div>
           </div>
         ) : (
-          <div className="space-y-3 max-h-[calc(100vh-180px)] overflow-y-auto pr-2 custom-scrollbar">
+          <div className="space-y-3 max-h-[380px] overflow-y-auto pr-2 custom-scrollbar">
             {assignments.map((a) => {
               const diff = timeDiff(now, a.deadlineDate);
               return <AssignmentCard key={a.id} a={a} diff={diff} onOpen={() => openLink(a)} />;
@@ -207,7 +236,7 @@ export default function Popup() {
         )}
 
         <div className="text-[10px] mt-4 text-slate-500 text-center px-2 pb-2">
-          💡 Tip: Click "Sync All" after submitting assignments to update the list
+          💡 Tip: Click "Refresh" after submitting assignments to update the list
         </div>
       </div>
     </div>
