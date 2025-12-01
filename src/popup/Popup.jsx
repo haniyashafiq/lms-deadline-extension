@@ -17,10 +17,14 @@ export default function Popup() {
         let list = Array.isArray(data.assignments) ? data.assignments : [];
 
         const nowDate = new Date();
+        const todayStart = new Date(nowDate);
+        todayStart.setHours(0, 0, 0, 0);
+
         const unsubmitted = list
           .filter((a) => {
             const deadline = a.deadline ? parseISO(a.deadline) : null;
-            const notOverdue = !deadline || deadline > nowDate;
+            // Include assignments due today or in the future
+            const notOverdue = !deadline || deadline >= todayStart;
             const notSubmitted = !a.status || !/submitted/i.test(a.status);
             return notOverdue && notSubmitted;
           })
@@ -52,6 +56,7 @@ export default function Popup() {
         setSyncProgress({ current: msg.current, total: msg.total, courseName: msg.courseName });
       } else if (msg.type === 'sync_complete') {
         setIsSyncing(false);
+        setSyncPhase('');
         setSyncProgress({ current: 0, total: 0, courseName: '' });
         fetchAssignments();
 
@@ -91,7 +96,7 @@ export default function Popup() {
         setIsSyncing(false);
         return;
       }
-      let targetTab = tabs.find(t => /Assignments\.php/i.test(t.url)) || tabs[0];
+      let targetTab = tabs.find((t) => /Assignments\.php/i.test(t.url)) || tabs[0];
 
       if (!/Assignments\.php/i.test(targetTab.url)) {
         setSyncPhase('Navigating to assignments page');
@@ -103,8 +108,13 @@ export default function Popup() {
             }
           };
           chrome.tabs.onUpdated.addListener(listener);
-          chrome.tabs.update(targetTab.id, { url: 'https://lms.bahria.edu.pk/Student/Assignments.php' });
-          setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 15000);
+          chrome.tabs.update(targetTab.id, {
+            url: 'https://lms.bahria.edu.pk/Student/Assignments.php',
+          });
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 15000);
         });
         targetTab = await chrome.tabs.get(targetTab.id);
       }
@@ -119,7 +129,10 @@ export default function Popup() {
             }
           };
           chrome.tabs.onUpdated.addListener(listener);
-          setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 15000);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 15000);
         });
       }
 
@@ -137,19 +150,23 @@ export default function Popup() {
             }
           };
           chrome.tabs.onUpdated.addListener(listener);
-          setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 15000);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }, 15000);
         });
         setSyncPhase('Retry: requesting course list');
         response = await chrome.runtime.sendMessage({ type: 'collect_all_courses' });
       }
 
       if (!response.ok) throw new Error(response.error || 'Sync failed');
-      setSyncPhase('Collecting courses ...');
+      // Background will send sync_progress and sync_complete messages
     } catch (err) {
       console.error('Sync error:', err);
-      setSyncPhase('Error: ' + (err.message || 'Unknown'));
-      alert(`Sync error: ${err.message}`);
+      const errorMsg = err.message || 'Unknown';
+      alert(`Sync error: ${errorMsg}`);
       setIsSyncing(false);
+      setSyncPhase('');
       setSyncProgress({ current: 0, total: 0, courseName: '' });
     }
   }
@@ -208,7 +225,9 @@ export default function Popup() {
           <div className="mt-3 text-[10px] text-white/90 space-y-1">
             {syncPhase && <div>{syncPhase}</div>}
             {isSyncing && syncProgress.total > 0 && (
-              <div>Course {syncProgress.current}/{syncProgress.total}: {syncProgress.courseName}</div>
+              <div>
+                Course {syncProgress.current}/{syncProgress.total}: {syncProgress.courseName}
+              </div>
             )}
           </div>
         )}

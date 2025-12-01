@@ -43,40 +43,66 @@ function scrapeAssignmentsFromDOM() {
     const lastCol = cols[cols.length - 1];
     let deadlineText = lastCol?.innerText?.trim?.() || '';
 
-    // Try to extract a reasonable date string from the last column:
-    // The view shows something like: "17 October 2025 - 12:00 pm\n12 October 2025-11:55 pm"
-    // We'll prefer the last line that looks like a date-time.
-    let lines = deadlineText
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean);
-    if (lines.length > 1) {
-      // prefer the line containing a month name or time
-      const monthRegex =
-        /\b(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i;
-      const candidate = lines.find((l) => monthRegex.test(l)) || lines[0];
-      deadlineText = candidate;
-    } else if (lines.length === 1) {
-      deadlineText = lines[0];
+    // Check for extended deadline (label-warning) vs actual deadline (label-info)
+    // Extended deadline has priority if present
+    const extendedLabel = lastCol?.querySelector('.label-warning');
+    const actualLabel = lastCol?.querySelector('.label-info');
+
+    if (extendedLabel) {
+      // Use extended deadline
+      deadlineText = extendedLabel.innerText?.trim?.() || '';
+      console.log(`  → Extended deadline found: "${deadlineText}"`);
+    } else if (actualLabel) {
+      // Use actual deadline
+      deadlineText = actualLabel.innerText?.trim?.() || '';
+      console.log(`  → Actual deadline found: "${deadlineText}"`);
     } else {
-      deadlineText = '';
+      // Fallback: parse text content
+      // Try to extract a reasonable date string from the last column:
+      // The view shows something like: "17 October 2025 - 12:00 pm\n12 October 2025-11:55 pm"
+      // We'll prefer the last line that looks like a date-time.
+      let lines = deadlineText
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+      if (lines.length > 1) {
+        // prefer the line containing a month name or time
+        const monthRegex =
+          /\b(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i;
+        const candidate = lines.find((l) => monthRegex.test(l)) || lines[0];
+        deadlineText = candidate;
+      } else if (lines.length === 1) {
+        deadlineText = lines[0];
+      } else {
+        deadlineText = '';
+      }
     }
 
-    // Normalise common separators
-    deadlineText = deadlineText.replace(/\s+-\s+/g, ' ').replace(/\u2013|\u2014/g, ' ');
+    // Normalise common separators and clean up the text
+    deadlineText = deadlineText
+      .replace(/\s+-\s+/g, ' ')
+      .replace(/\u2013|\u2014/g, ' ')
+      .replace(/-/g, ' ');
 
     // Try parse date
     let deadline = null;
     if (deadlineText) {
+      console.log(`  → Parsing deadline: "${deadlineText}"`);
       const tryDate = Date.parse(deadlineText);
       if (!isNaN(tryDate)) {
         deadline = new Date(tryDate);
+        console.log(`  → Parsed successfully: ${deadline.toISOString()}`);
       } else {
         // Fallback attempt: try to remove trailing labels
         const isoMatch = deadlineText.match(/\d{1,2}\s+\w+\s+\d{4}.*$/);
         const pick = isoMatch ? isoMatch[0] : deadlineText;
         const parsed = Date.parse(pick);
-        if (!isNaN(parsed)) deadline = new Date(parsed);
+        if (!isNaN(parsed)) {
+          deadline = new Date(parsed);
+          console.log(`  → Parsed with fallback: ${deadline.toISOString()}`);
+        } else {
+          console.log(`  → Failed to parse deadline`);
+        }
       }
     }
 
