@@ -85,28 +85,6 @@ function clearAlarmsForAssignmentId(aid) {
   });
 }
 
-function ensureContentScript(tabId) {
-  return new Promise((resolve, reject) => {
-    if (!chrome.scripting) {
-      reject(new Error('scripting API unavailable'));
-      return;
-    }
-    chrome.scripting.executeScript(
-      {
-        target: { tabId },
-        files: ['content.js'],
-      },
-      () => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-        } else {
-          resolve();
-        }
-      }
-    );
-  });
-}
-
 async function mergeAssignments(incoming) {
   if (!incoming || !incoming.length) return;
   const stored = await getStoredAssignments();
@@ -436,60 +414,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // Use the first LMS tab found
       const t = lmsTabs[0];
 
-      const continueWithOptions = (options) => {
-        if (!options || options.length === 0) {
+      // Ask the tab for course options and then start
+      chrome.tabs.sendMessage(t.id, { type: 'get_course_options' }, (resp) => {
+        if (chrome.runtime.lastError || !resp || !resp.options) {
+          const error =
+            chrome.runtime.lastError?.message || 'Could not get course options from page';
+          sendResponse({ ok: false, error });
+          return;
+        }
+
+        if (!resp.options || resp.options.length === 0) {
           sendResponse({ ok: false, error: 'No courses found on the LMS page' });
           return;
         }
 
-        collectAllCoursesFromTab(t.id, t.url, options)
+        collectAllCoursesFromTab(t.id, t.url, resp.options)
           .then(() => sendResponse({ ok: true }))
           .catch((err) => {
             console.error(err);
             sendResponse({ ok: false, error: String(err) });
           });
-      };
-
-      const reportMissingContentScript = () => {
-        sendResponse({
-          ok: false,
-          error: 'Could not connect to the LMS tab. Please refresh the LMS page and try again.',
-        });
-      };
-
-      const requestOptions = () => {
-        chrome.tabs.sendMessage(t.id, { type: 'get_course_options' }, (resp) => {
-          if (chrome.runtime.lastError || !resp || !resp.options) {
-            const errorMessage =
-              chrome.runtime.lastError?.message || 'Could not get course options from page';
-
-            if (/Receiving end does not exist/i.test(errorMessage)) {
-              ensureContentScript(t.id)
-                .then(() => {
-                  chrome.tabs.sendMessage(t.id, { type: 'get_course_options' }, (retryResp) => {
-                    if (chrome.runtime.lastError || !retryResp || !retryResp.options) {
-                      reportMissingContentScript();
-                      return;
-                    }
-                    continueWithOptions(retryResp.options);
-                  });
-                })
-                .catch((reinjectionErr) => {
-                  console.warn('Content script reinjection failed:', reinjectionErr);
-                  reportMissingContentScript();
-                });
-              return;
-            }
-
-            sendResponse({ ok: false, error: errorMessage });
-            return;
-          }
-
-          continueWithOptions(resp.options);
-        });
-      };
-
-      requestOptions();
+      });
     });
     return true; // indicate we'll send response asynchronously
   }
