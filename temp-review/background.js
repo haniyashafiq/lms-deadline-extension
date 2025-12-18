@@ -85,173 +85,6 @@ function clearAlarmsForAssignmentId(aid) {
   });
 }
 
-function ensureContentScript(tabId) {
-  return new Promise((resolve, reject) => {
-    if (!chrome.scripting || typeof chrome.scripting.executeScript !== 'function') {
-      resolve(false);
-      return;
-    }
-    chrome.scripting.executeScript(
-      {
-        target: { tabId },
-        files: ['content.js'],
-      },
-      () => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-        } else {
-          resolve(true);
-        }
-      }
-    );
-  });
-}
-
-function sendMessageToTab(tabId, payload) {
-  return new Promise((resolve, reject) => {
-    chrome.tabs.sendMessage(tabId, payload, (resp) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-        return;
-      }
-      resolve(resp);
-    });
-  });
-}
-
-function reloadTabAndWait(tabId, { timeoutMs = 20000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const timeoutId = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      reject(new Error('Timed out waiting for LMS tab to reload'));
-    }, timeoutMs);
-
-    function cleanup(err) {
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      clearTimeout(timeoutId);
-      if (err) {
-        reject(err);
-      } else {
-        setTimeout(resolve, 250);
-      }
-    }
-
-    function onUpdated(updatedTabId, changeInfo) {
-      if (updatedTabId === tabId && changeInfo.status === 'complete') {
-        cleanup();
-      }
-    }
-
-    chrome.tabs.onUpdated.addListener(onUpdated);
-    chrome.tabs.reload(tabId, { bypassCache: true }, () => {
-      if (chrome.runtime.lastError) {
-        cleanup(new Error(chrome.runtime.lastError.message));
-      }
-    });
-  });
-}
-
-async function getCourseOptionsWithRecovery(tabId) {
-  async function attempt() {
-    const resp = await sendMessageToTab(tabId, { type: 'get_course_options' });
-    const options = Array.isArray(resp?.options) ? resp.options : null;
-    if (!options || options.length === 0) {
-      throw new Error('No courses found on the LMS page');
-    }
-    return options;
-  }
-
-  let lastErr = null;
-  let attemptsLeft = 4;
-
-  while (attemptsLeft > 0) {
-    try {
-      return await attempt();
-    } catch (err) {
-      lastErr = err;
-      attemptsLeft -= 1;
-
-      const message = err?.message || '';
-      const missingReceiver = /Receiving end does not exist/i.test(message);
-
-      if (!missingReceiver) {
-        throw err;
-      }
-
-      const step = attemptsLeft;
-      if (step === 3) {
-        try {
-          const injected = await ensureContentScript(tabId);
-          if (!injected) {
-            console.warn('scripting API unavailable; skipping reinjection');
-          }
-        } catch (reinjectionErr) {
-          console.warn('Content script reinjection failed:', reinjectionErr);
-        }
-      } else if (step === 2) {
-        try {
-          await reloadTabAndWait(tabId);
-        } catch (reloadErr) {
-          console.warn('Reloading LMS tab failed:', reloadErr);
-        }
-      } else if (step === 1) {
-        try {
-          const newTab = await openAssignmentsTab();
-          tabId = newTab.id;
-        } catch (openErr) {
-          console.warn('Opening fresh LMS tab failed:', openErr);
-        }
-      } else {
-        break;
-      }
-    }
-  }
-
-  throw lastErr || new Error('Could not get course options from page');
-}
-
-function openAssignmentsTab() {
-  const targetUrl = 'https://lms.bahria.edu.pk/Student/Assignments.php';
-  return new Promise((resolve, reject) => {
-    chrome.tabs.create({ url: targetUrl, active: true }, (tab) => {
-      if (chrome.runtime.lastError || !tab?.id) {
-        reject(new Error(chrome.runtime.lastError?.message || 'Could not open LMS tab'));
-        return;
-      }
-
-      const tabId = tab.id;
-      const timeoutId = setTimeout(() => {
-        chrome.tabs.onUpdated.removeListener(onUpdated);
-        reject(new Error('Timed out waiting for LMS tab to open'));
-      }, 20000);
-
-      function cleanup(err) {
-        chrome.tabs.onUpdated.removeListener(onUpdated);
-        clearTimeout(timeoutId);
-        if (err) {
-          reject(err);
-          return;
-        }
-        chrome.tabs.get(tabId, (latest) => {
-          if (chrome.runtime.lastError || !latest) {
-            reject(new Error(chrome.runtime.lastError?.message || 'Could not read LMS tab'));
-            return;
-          }
-          resolve(latest);
-        });
-      }
-
-      function onUpdated(updatedTabId, changeInfo) {
-        if (updatedTabId === tabId && changeInfo.status === 'complete') {
-          setTimeout(() => cleanup(), 250);
-        }
-      }
-
-      chrome.tabs.onUpdated.addListener(onUpdated);
-    });
-  });
-}
-
 async function mergeAssignments(incoming) {
   if (!incoming || !incoming.length) return;
   const stored = await getStoredAssignments();
@@ -580,16 +413,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       // Use the first LMS tab found
       const t = lmsTabs[0];
-      (async () => {
-        try {
-          const options = await getCourseOptionsWithRecovery(t.id);
-          await collectAllCoursesFromTab(t.id, t.url, options);
-          sendResponse({ ok: true });
-        } catch (err) {
-          const message = err?.message || 'Could not get course options from page';
-          sendResponse({ ok: false, error: message });
+
+      // Ask the tab for course options and then start
+      chrome.tabs.sendMessage(t.id, { type: 'get_course_options' }, (resp) => {
+        if (chrome.runtime.lastError || !resp || !resp.options) {
+          const error =
+            chrome.runtime.lastError?.message || 'Could not get course options from page';
+          sendResponse({ ok: false, error });
+          return;
         }
-      })();
+
+        if (!resp.options || resp.options.length === 0) {
+          sendResponse({ ok: false, error: 'No courses found on the LMS page' });
+          return;
+        }
+
+        collectAllCoursesFromTab(t.id, t.url, resp.options)
+          .then(() => sendResponse({ ok: true }))
+          .catch((err) => {
+            console.error(err);
+            sendResponse({ ok: false, error: String(err) });
+          });
+      });
     });
     return true; // indicate we'll send response asynchronously
   }
