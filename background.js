@@ -55,6 +55,49 @@ async function markNotificationShown(assignmentId, offsetKey) {
   });
 }
 
+async function clearShownNotificationsForAssignment(assignmentId) {
+  const shown = await getShownNotifications();
+  let mutated = false;
+  Object.keys(shown).forEach((key) => {
+    if (key.startsWith(`${assignmentId}::`)) {
+      delete shown[key];
+      mutated = true;
+    }
+  });
+  if (!mutated) return;
+  return new Promise((res) => {
+    chrome.storage.local.set({ shownNotifications: shown }, () => res());
+  });
+}
+
+function clearActiveNotificationsForAssignment(assignmentId) {
+  REMINDER_OFFSETS.forEach((offset) => {
+    const notificationId = `${assignmentId}::${offset.key}`;
+    chrome.notifications.clear(notificationId);
+  });
+}
+
+async function removeAssignmentById(assignmentId) {
+  if (!assignmentId) return null;
+  const assignments = await getStoredAssignments();
+  const idx = assignments.findIndex((a) => a.id === assignmentId);
+  if (idx === -1) return null;
+  const [removed] = assignments.splice(idx, 1);
+  await setStoredAssignments(assignments);
+  clearAlarmsForAssignmentId(assignmentId);
+  await clearShownNotificationsForAssignment(assignmentId);
+  clearActiveNotificationsForAssignment(assignmentId);
+  return removed;
+}
+
+async function openAssignmentLinkFromStorage(assignmentId) {
+  if (!assignmentId) return;
+  const assignments = await getStoredAssignments();
+  const assignment = assignments.find((a) => a.id === assignmentId);
+  const targetUrl = assignment?.link || 'https://lms.bahria.edu.pk/Student/Assignments.php';
+  chrome.tabs.create({ url: targetUrl });
+}
+
 function formatDueDateString(deadlineMs) {
   try {
     const d = new Date(deadlineMs);
@@ -331,6 +374,7 @@ async function checkAndNotifyUpcomingDeadlines() {
           iconUrl: chrome.runtime.getURL('icon128.png'),
           requireInteraction: true,
           priority: 2,
+          buttons: [{ title: 'Mark submitted' }, { title: 'Open assignment' }],
         },
         () => {
           console.log(`📬 Periodic notification shown: ${a.title} (${keyToUse})`);
@@ -566,6 +610,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
 
+  if (msg.type === 'mark_assignment_submitted') {
+    const assignmentId = msg.assignmentId;
+    if (!assignmentId) {
+      sendResponse({ ok: false, error: 'Missing assignmentId' });
+      return;
+    }
+    (async () => {
+      try {
+        const removed = await removeAssignmentById(assignmentId);
+        sendResponse({ ok: !!removed });
+      } catch (err) {
+        console.error('Failed to mark assignment submitted:', err);
+        sendResponse({ ok: false, error: err?.message || 'Failed to update assignment' });
+      }
+    })();
+    return true;
+  }
+
   // Popup (or user) requested an on-demand full collection from a specific tab
   if (msg.type === 'collect_all_courses') {
     // First try to find any LMS tab
@@ -644,6 +706,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
             iconUrl: chrome.runtime.getURL('icon128.png'),
             requireInteraction: true,
             priority: 2,
+            buttons: [{ title: 'Mark submitted' }, { title: 'Open assignment' }],
           },
           async () => {
             // Mark as shown to prevent duplicate from periodic check
@@ -655,6 +718,30 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   } catch (err) {
     console.error('Alarm error:', err);
   }
+});
+
+chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
+  if (!notificationId) return;
+  const parts = notificationId.split('::');
+  if (parts.length < 2) return;
+  const assignmentId = parts[0];
+  if (buttonIndex === 0) {
+    removeAssignmentById(assignmentId)
+      .then(() => {
+        chrome.notifications.clear(notificationId);
+      })
+      .catch((err) => console.error('Failed to handle notification action:', err));
+  } else if (buttonIndex === 1) {
+    openAssignmentLinkFromStorage(assignmentId);
+  }
+});
+
+chrome.notifications.onClicked.addListener((notificationId) => {
+  if (!notificationId) return;
+  const parts = notificationId.split('::');
+  if (parts.length < 2) return;
+  const assignmentId = parts[0];
+  openAssignmentLinkFromStorage(assignmentId);
 });
 
 // On install: default settings and periodic alarm
