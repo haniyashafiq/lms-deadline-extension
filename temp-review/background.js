@@ -55,49 +55,6 @@ async function markNotificationShown(assignmentId, offsetKey) {
   });
 }
 
-async function clearShownNotificationsForAssignment(assignmentId) {
-  const shown = await getShownNotifications();
-  let mutated = false;
-  Object.keys(shown).forEach((key) => {
-    if (key.startsWith(`${assignmentId}::`)) {
-      delete shown[key];
-      mutated = true;
-    }
-  });
-  if (!mutated) return;
-  return new Promise((res) => {
-    chrome.storage.local.set({ shownNotifications: shown }, () => res());
-  });
-}
-
-function clearActiveNotificationsForAssignment(assignmentId) {
-  REMINDER_OFFSETS.forEach((offset) => {
-    const notificationId = `${assignmentId}::${offset.key}`;
-    chrome.notifications.clear(notificationId);
-  });
-}
-
-async function removeAssignmentById(assignmentId) {
-  if (!assignmentId) return null;
-  const assignments = await getStoredAssignments();
-  const idx = assignments.findIndex((a) => a.id === assignmentId);
-  if (idx === -1) return null;
-  const [removed] = assignments.splice(idx, 1);
-  await setStoredAssignments(assignments);
-  clearAlarmsForAssignmentId(assignmentId);
-  await clearShownNotificationsForAssignment(assignmentId);
-  clearActiveNotificationsForAssignment(assignmentId);
-  return removed;
-}
-
-async function openAssignmentLinkFromStorage(assignmentId) {
-  if (!assignmentId) return;
-  const assignments = await getStoredAssignments();
-  const assignment = assignments.find((a) => a.id === assignmentId);
-  const targetUrl = assignment?.link || 'https://lms.bahria.edu.pk/Student/Assignments.php';
-  chrome.tabs.create({ url: targetUrl });
-}
-
 function formatDueDateString(deadlineMs) {
   try {
     const d = new Date(deadlineMs);
@@ -125,151 +82,6 @@ function clearAlarmsForAssignmentId(aid) {
   chrome.alarms.getAll((alarms) => {
     const related = alarms.filter((al) => al.name && al.name.startsWith(aid + '::'));
     related.forEach((a) => chrome.alarms.clear(a.name));
-  });
-}
-
-function sendMessageToTab(tabId, payload) {
-  return new Promise((resolve, reject) => {
-    chrome.tabs.sendMessage(tabId, payload, (resp) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-        return;
-      }
-      resolve(resp);
-    });
-  });
-}
-
-function reloadTabAndWait(tabId, { timeoutMs = 20000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const timeoutId = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      reject(new Error('Timed out waiting for LMS tab to reload'));
-    }, timeoutMs);
-
-    function cleanup(err) {
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      clearTimeout(timeoutId);
-      if (err) {
-        reject(err);
-      } else {
-        setTimeout(resolve, 250);
-      }
-    }
-
-    function onUpdated(updatedTabId, changeInfo) {
-      if (updatedTabId === tabId && changeInfo.status === 'complete') {
-        cleanup();
-      }
-    }
-
-    chrome.tabs.onUpdated.addListener(onUpdated);
-    chrome.tabs.reload(tabId, { bypassCache: true }, () => {
-      if (chrome.runtime.lastError) {
-        cleanup(new Error(chrome.runtime.lastError.message));
-      }
-    });
-  });
-}
-
-async function getCourseOptionsWithRecovery(tabId) {
-  async function attempt() {
-    const resp = await sendMessageToTab(tabId, { type: 'get_course_options' });
-    const options = Array.isArray(resp?.options) ? resp.options : null;
-    if (!options || options.length === 0) {
-      throw new Error('No courses found on the LMS page');
-    }
-    return options;
-  }
-
-  let lastErr = null;
-  let attemptsLeft = 4;
-
-  while (attemptsLeft > 0) {
-    try {
-      return await attempt();
-    } catch (err) {
-      lastErr = err;
-      attemptsLeft -= 1;
-
-      const message = err?.message || '';
-      const missingReceiver = /Receiving end does not exist/i.test(message);
-
-      if (!missingReceiver) {
-        throw err;
-      }
-
-      const step = attemptsLeft;
-      if (step === 3) {
-        try {
-          const injected = await ensureContentScript(tabId);
-          if (!injected) {
-            console.warn('scripting API unavailable; skipping reinjection');
-          }
-        } catch (reinjectionErr) {
-          console.warn('Content script reinjection failed:', reinjectionErr);
-        }
-      } else if (step === 2) {
-        try {
-          await reloadTabAndWait(tabId);
-        } catch (reloadErr) {
-          console.warn('Reloading LMS tab failed:', reloadErr);
-        }
-      } else if (step === 1) {
-        try {
-          const newTab = await openAssignmentsTab();
-          tabId = newTab.id;
-        } catch (openErr) {
-          console.warn('Opening fresh LMS tab failed:', openErr);
-        }
-      } else {
-        break;
-      }
-    }
-  }
-
-  throw lastErr || new Error('Could not get course options from page');
-}
-
-function openAssignmentsTab() {
-  const targetUrl = 'https://lms.bahria.edu.pk/Student/Assignments.php';
-  return new Promise((resolve, reject) => {
-    chrome.tabs.create({ url: targetUrl, active: true }, (tab) => {
-      if (chrome.runtime.lastError || !tab?.id) {
-        reject(new Error(chrome.runtime.lastError?.message || 'Could not open LMS tab'));
-        return;
-      }
-
-      const tabId = tab.id;
-      const timeoutId = setTimeout(() => {
-        chrome.tabs.onUpdated.removeListener(onUpdated);
-        reject(new Error('Timed out waiting for LMS tab to open'));
-      }, 20000);
-
-      function cleanup(err) {
-        chrome.tabs.onUpdated.removeListener(onUpdated);
-        clearTimeout(timeoutId);
-        if (err) {
-          reject(err);
-          return;
-        }
-        chrome.tabs.get(tabId, (latest) => {
-          if (chrome.runtime.lastError || !latest) {
-            reject(new Error(chrome.runtime.lastError?.message || 'Could not read LMS tab'));
-            return;
-          }
-          resolve(latest);
-        });
-      }
-
-      function onUpdated(updatedTabId, changeInfo) {
-        if (updatedTabId === tabId && changeInfo.status === 'complete') {
-          setTimeout(() => cleanup(), 250);
-        }
-      }
-
-      chrome.tabs.onUpdated.addListener(onUpdated);
-    });
   });
 }
 
@@ -352,7 +164,6 @@ async function checkAndNotifyUpcomingDeadlines() {
           iconUrl: chrome.runtime.getURL('icon128.png'),
           requireInteraction: true,
           priority: 2,
-          buttons: [{ title: 'Mark submitted' }, { title: 'Open assignment' }],
         },
         () => {
           console.log(`📬 Periodic notification shown: ${a.title} (${keyToUse})`);
@@ -422,9 +233,9 @@ async function collectAllCoursesFromTab(tabId, baseUrl, options) {
   isCollectingAll = true;
   console.log('🔄 Starting full collection of all courses...');
 
-  // Clear existing assignments before full sync to ensure submitted assignments are removed
+  // Clear old assignments before starting fresh sync
   await setStoredAssignments([]);
-  console.log('🗑️ Cleared existing assignments for fresh sync');
+  console.log('🗑️ Cleared old assignments from storage');
 
   const collected = [];
   const failedCourses = [];
@@ -560,39 +371,6 @@ async function collectAllCoursesFromTab(tabId, baseUrl, options) {
   }
 }
 
-// Helper: Ensure content script is injected in the tab
-async function ensureContentScript(tabId) {
-  try {
-    // Try to ping the content script first
-    const response = await new Promise((resolve) => {
-      chrome.tabs.sendMessage(tabId, { type: 'ping' }, (resp) => {
-        if (chrome.runtime.lastError) {
-          resolve(null);
-        } else {
-          resolve(resp);
-        }
-      });
-    });
-
-    // If we got a response, content script is already loaded
-    if (response) return true;
-
-    // Otherwise, inject it programmatically
-    console.log('📌 Injecting content script into tab', tabId);
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ['content.js'],
-    });
-
-    // Wait a bit for the script to initialize
-    await wait(300);
-    return true;
-  } catch (err) {
-    console.error('Failed to inject content script:', err);
-    return false;
-  }
-}
-
 // Message routing: handle messages from content script or popup
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return;
@@ -621,28 +399,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
 
-  if (msg.type === 'mark_assignment_submitted') {
-    const assignmentId = msg.assignmentId;
-    if (!assignmentId) {
-      sendResponse({ ok: false, error: 'Missing assignmentId' });
-      return;
-    }
-    (async () => {
-      try {
-        const removed = await removeAssignmentById(assignmentId);
-        sendResponse({ ok: !!removed });
-      } catch (err) {
-        console.error('Failed to mark assignment submitted:', err);
-        sendResponse({ ok: false, error: err?.message || 'Failed to update assignment' });
-      }
-    })();
-    return true;
-  }
-
   // Popup (or user) requested an on-demand full collection from a specific tab
   if (msg.type === 'collect_all_courses') {
     // First try to find any LMS tab
-    chrome.tabs.query({ url: '*://lms.bahria.edu.pk/*' }, async (lmsTabs) => {
+    chrome.tabs.query({ url: '*://lms.bahria.edu.pk/*' }, (lmsTabs) => {
       if (!lmsTabs || lmsTabs.length === 0) {
         sendResponse({
           ok: false,
@@ -653,16 +413,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       // Use the first LMS tab found
       const t = lmsTabs[0];
-      (async () => {
-        try {
-          const options = await getCourseOptionsWithRecovery(t.id);
-          await collectAllCoursesFromTab(t.id, t.url, options);
-          sendResponse({ ok: true });
-        } catch (err) {
-          const message = err?.message || 'Could not get course options from page';
-          sendResponse({ ok: false, error: message });
+
+      // Ask the tab for course options and then start
+      chrome.tabs.sendMessage(t.id, { type: 'get_course_options' }, (resp) => {
+        if (chrome.runtime.lastError || !resp || !resp.options) {
+          const error =
+            chrome.runtime.lastError?.message || 'Could not get course options from page';
+          sendResponse({ ok: false, error });
+          return;
         }
-      })();
+
+        if (!resp.options || resp.options.length === 0) {
+          sendResponse({ ok: false, error: 'No courses found on the LMS page' });
+          return;
+        }
+
+        collectAllCoursesFromTab(t.id, t.url, resp.options)
+          .then(() => sendResponse({ ok: true }))
+          .catch((err) => {
+            console.error(err);
+            sendResponse({ ok: false, error: String(err) });
+          });
+      });
     });
     return true; // indicate we'll send response asynchronously
   }
@@ -717,7 +489,6 @@ chrome.alarms.onAlarm.addListener((alarm) => {
             iconUrl: chrome.runtime.getURL('icon128.png'),
             requireInteraction: true,
             priority: 2,
-            buttons: [{ title: 'Mark submitted' }, { title: 'Open assignment' }],
           },
           async () => {
             // Mark as shown to prevent duplicate from periodic check
@@ -729,30 +500,6 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   } catch (err) {
     console.error('Alarm error:', err);
   }
-});
-
-chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
-  if (!notificationId) return;
-  const parts = notificationId.split('::');
-  if (parts.length < 2) return;
-  const assignmentId = parts[0];
-  if (buttonIndex === 0) {
-    removeAssignmentById(assignmentId)
-      .then(() => {
-        chrome.notifications.clear(notificationId);
-      })
-      .catch((err) => console.error('Failed to handle notification action:', err));
-  } else if (buttonIndex === 1) {
-    openAssignmentLinkFromStorage(assignmentId);
-  }
-});
-
-chrome.notifications.onClicked.addListener((notificationId) => {
-  if (!notificationId) return;
-  const parts = notificationId.split('::');
-  if (parts.length < 2) return;
-  const assignmentId = parts[0];
-  openAssignmentLinkFromStorage(assignmentId);
 });
 
 // On install: default settings and periodic alarm

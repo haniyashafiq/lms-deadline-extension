@@ -9,34 +9,6 @@ if (window.__LMS_ASSIGNMENT_SCRAPER__) {
   console.log('📌 LMS content script loaded');
 }
 
-function safeSendMessage(message, contextTag = 'runtime') {
-  const logError = (err) => {
-    if (!err) return;
-    const msg = err.message || String(err);
-    const missingReceiver = /Receiving end does not exist/i.test(msg);
-    const prefix = `[safeSendMessage:${contextTag}]`;
-    if (missingReceiver) {
-      console.info(prefix, 'Background not ready yet; message skipped.');
-    } else {
-      console.warn(prefix, msg);
-    }
-  };
-
-  try {
-    const maybePromise = chrome.runtime.sendMessage(message, () => {
-      if (chrome.runtime.lastError) {
-        logError(chrome.runtime.lastError);
-      }
-    });
-
-    if (maybePromise && typeof maybePromise.catch === 'function') {
-      maybePromise.catch((err) => logError(err));
-    }
-  } catch (err) {
-    logError(err);
-  }
-}
-
 /**
  * Scrape assignments from the currently visible assignments table.
  * Returns an array of objects: { title, course, deadlineText, deadline, link }
@@ -187,13 +159,10 @@ try {
     const assignments = scrapeAssignmentsFromDOM();
     if (assignments.length > 0) {
       console.log('📨 Auto-scraped', assignments.length, 'assignments from current view');
-      safeSendMessage(
-        {
-          type: 'lms_assignments',
-          assignments,
-        },
-        'auto_scrape'
-      );
+      chrome.runtime.sendMessage({
+        type: 'lms_assignments',
+        assignments,
+      });
     }
   }, 150);
 } catch (e) {
@@ -206,16 +175,12 @@ try {
 // Listen for messages from background
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return;
-  if (msg.type === 'ping') {
-    // Health check to see if content script is loaded
-    sendResponse({ ok: true });
-    return true;
-  } else if (msg.type === 'scrape_now') {
+  if (msg.type === 'scrape_now') {
     // background asked this tab to scrape immediately
     const assignments = scrapeAssignmentsFromDOM();
     // reply directly if sender expects response
     // also send a broadcast for background listeners
-    safeSendMessage({ type: 'lms_assignments_partial', assignments }, 'manual_scrape');
+    chrome.runtime.sendMessage({ type: 'lms_assignments_partial', assignments });
     // optional direct response
     sendResponse({ ok: true, assignments });
     return true; // indicate async response possible

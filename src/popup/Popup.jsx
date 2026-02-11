@@ -84,6 +84,23 @@ export default function Popup() {
     chrome.tabs.create({ url: a.link || 'https://lms.bahria.edu.pk/Student/Assignments.php' });
   }
 
+  async function markAsSubmitted(a) {
+    if (!a?.id) return;
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: 'mark_assignment_submitted',
+        assignmentId: a.id,
+      });
+      if (!response?.ok) {
+        throw new Error(response?.error || 'Update failed');
+      }
+      setAssignments((prev) => prev.filter((item) => item.id !== a.id));
+    } catch (err) {
+      console.error('Failed to mark submitted:', err);
+      alert('Could not mark assignment as submitted. Please refresh and try again.');
+    }
+  }
+
   async function syncAllCourses() {
     if (isSyncing) return;
     setIsSyncing(true);
@@ -251,13 +268,21 @@ export default function Popup() {
           <div className="space-y-3 max-h-[380px] overflow-y-auto pr-2 custom-scrollbar">
             {assignments.map((a) => {
               const diff = timeDiff(now, a.deadlineDate);
-              return <AssignmentCard key={a.id} a={a} diff={diff} onOpen={() => openLink(a)} />;
+              return (
+                <AssignmentCard
+                  key={a.id}
+                  a={a}
+                  diff={diff}
+                  onOpen={() => openLink(a)}
+                  onMarkSubmitted={() => markAsSubmitted(a)}
+                />
+              );
             })}
           </div>
         )}
 
         <div className="text-[10px] mt-4 text-slate-500 text-center px-2 pb-2">
-          💡 Tip: Click "Refresh" after submitting assignments to update the list
+          💡 Tip: Mark a card as submitted or press "Refresh" to update the list instantly.
         </div>
       </div>
     </div>
