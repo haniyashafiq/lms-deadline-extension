@@ -233,6 +233,10 @@ async function collectAllCoursesFromTab(tabId, baseUrl, options) {
   isCollectingAll = true;
   console.log('🔄 Starting full collection of all courses...');
 
+  // Clear existing assignments before full sync to ensure submitted assignments are removed
+  await setStoredAssignments([]);
+  console.log('🗑️ Cleared existing assignments for fresh sync');
+
   const collected = [];
   const failedCourses = [];
   const totalCourses = options.length;
@@ -367,6 +371,39 @@ async function collectAllCoursesFromTab(tabId, baseUrl, options) {
   }
 }
 
+// Helper: Ensure content script is injected in the tab
+async function ensureContentScript(tabId) {
+  try {
+    // Try to ping the content script first
+    const response = await new Promise((resolve) => {
+      chrome.tabs.sendMessage(tabId, { type: 'ping' }, (resp) => {
+        if (chrome.runtime.lastError) {
+          resolve(null);
+        } else {
+          resolve(resp);
+        }
+      });
+    });
+
+    // If we got a response, content script is already loaded
+    if (response) return true;
+
+    // Otherwise, inject it programmatically
+    console.log('📌 Injecting content script into tab', tabId);
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content.js'],
+    });
+
+    // Wait a bit for the script to initialize
+    await wait(300);
+    return true;
+  } catch (err) {
+    console.error('Failed to inject content script:', err);
+    return false;
+  }
+}
+
 // Message routing: handle messages from content script or popup
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return;
@@ -398,7 +435,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Popup (or user) requested an on-demand full collection from a specific tab
   if (msg.type === 'collect_all_courses') {
     // First try to find any LMS tab
-    chrome.tabs.query({ url: '*://lms.bahria.edu.pk/*' }, (lmsTabs) => {
+    chrome.tabs.query({ url: '*://lms.bahria.edu.pk/*' }, async (lmsTabs) => {
       if (!lmsTabs || lmsTabs.length === 0) {
         sendResponse({
           ok: false,
@@ -409,6 +446,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       // Use the first LMS tab found
       const t = lmsTabs[0];
+
+      // Ensure content script is loaded
+      const injected = await ensureContentScript(t.id);
+      if (!injected) {
+        sendResponse({ ok: false, error: 'Failed to inject content script' });
+        return;
+      }
 
       // Ask the tab for course options and then start
       chrome.tabs.sendMessage(t.id, { type: 'get_course_options' }, (resp) => {

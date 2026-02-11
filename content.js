@@ -164,7 +164,11 @@ try {
 // Listen for messages from background
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return;
-  if (msg.type === 'scrape_now') {
+  if (msg.type === 'ping') {
+    // Health check to see if content script is loaded
+    sendResponse({ ok: true });
+    return true;
+  } else if (msg.type === 'scrape_now') {
     // background asked this tab to scrape immediately
     const assignments = scrapeAssignmentsFromDOM();
     // reply directly if sender expects response

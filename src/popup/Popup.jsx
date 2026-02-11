@@ -25,7 +25,9 @@ export default function Popup() {
             const deadline = a.deadline ? parseISO(a.deadline) : null;
             // Include assignments due today or in the future
             const notOverdue = !deadline || deadline >= todayStart;
-            const notSubmitted = !a.status || !/submitted/i.test(a.status);
+            // Check if not submitted: status should be "No Submission" or empty
+            // Submitted statuses include: "Submission", "Added Submission", etc.
+            const notSubmitted = !a.status || /no\s+submission/i.test(a.status);
             return notOverdue && notSubmitted;
           })
           .map((a) => ({ ...a, deadlineDate: a.deadline ? parseISO(a.deadline) : null }));
